@@ -1,134 +1,86 @@
-name: COLMAP (Windows 10, CUDA 11.8)
-
-on:
-  workflow_dispatch:
-
-concurrency:
-  group: colmap-win-cu118-${{ github.ref }}
-  cancel-in-progress: true
+name: build-windows-colmap_cuda12
+on: workflow_dispatch
 
 jobs:
   build:
-    # windows-2019 is retired on GitHub-hosted runners, so jobs requesting it never start.
-    # windows-2022 ships MSVC 14.44, which CUDA 11.8 rejects (C1189); pin an older
-    # toolset (14.38) via msvc-dev-cmd so nvcc accepts the host compiler.
     runs-on: windows-2022
-    timeout-minutes: 360
-
     env:
-      # Binary cache for vcpkg packages (uses the GitHub Actions cache backend).
-      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
-
+      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+      VCPKG_DEFAULT_TRIPLET: x64-windows
     steps:
-      - name: Checkout (with submodules)
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
+          repository: colmap/colmap
           submodules: recursive
 
-      - name: Install CUDA 11.8 toolkit
-        uses: Jimver/cuda-toolkit@v0.2.19
+      - uses: actions/setup-python@v5
         with:
-          cuda: "11.8.0"
+          python-version: '3.10'
+
+      # CUDA 12.4.0 to match the rest of the pipeline
+      - uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: '12.4.0'
           method: network
-          sub-packages: '["nvcc","cudart","thrust","visual_studio_integration","cublas_dev","cusparse_dev","cusolver_dev","curand_dev"]'
+          use-github-cache: false
+          sub-packages: '["nvcc","cudart","thrust","visual_studio_integration","cublas_dev","cusparse_dev","cusolver_dev","curand_dev","nvrtc","nvrtc_dev"]'
 
-      # windows-2022 has VS 2022 but not the 14.38 toolset, so add it before use.
-      - name: Install MSVC 14.38 toolset
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
-          $vsPath = & "$installer\vswhere.exe" -latest -products * -property installationPath
-          if (-not $vsPath) { throw "Visual Studio installation not found" }
-          & "$installer\vs_installer.exe" modify --installPath "$vsPath" `
-            --add Microsoft.VisualStudio.Component.VC.14.38.17.8.x86.x64 `
-            --quiet --norestart --force
-          # 0 = success, 3010 = success but reboot requested (not needed here)
-          if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) {
-            throw "vs_installer failed with exit code $LASTEXITCODE"
-          }
-          if (-not (Get-ChildItem "$vsPath\VC\Tools\MSVC" -Directory -Filter "14.38.*" -ErrorAction SilentlyContinue)) {
-            throw "MSVC 14.38 toolset still missing after install"
-          }
+      - uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Set up MSVC 14.38 environment
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-          toolset: "14.38"
-
-      - name: Install CMake and Ninja
-        shell: pwsh
-        run: choco install cmake ninja -y --no-progress
+      - name: Install ninja and cmake
+        run: pip install cmake ninja
 
       - name: Bootstrap vcpkg
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          git clone --depth 1 https://github.com/Microsoft/vcpkg.git "$env:GITHUB_WORKSPACE/vcpkg"
-          & "$env:GITHUB_WORKSPACE/vcpkg/bootstrap-vcpkg.bat" -disableMetrics
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
 
-      # No separate "vcpkg install" step: with the toolchain file below, CMake
-      # runs vcpkg in manifest mode (vcpkg.json) during configure.
       - name: Configure
-        shell: pwsh
+        shell: bash
+        env:
+          CUDA_PATH_V124: ${{ env.CUDA_PATH }}
+          # Guard against the windows-2022 MSVC being newer than CUDA 12.4 officially supports
+          NVCC_APPEND_FLAGS: "-allow-unsupported-compiler -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
+          CL: "/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
         run: |
-          $ErrorActionPreference = "Stop"
-          $src = $env:GITHUB_WORKSPACE
-          $toolchain = "$src/vcpkg/scripts/buildsystems/vcpkg.cmake"
-          New-Item -ItemType Directory -Force -Path "$src/build" | Out-Null
-          Set-Location "$src/build"
-          cmake .. -G Ninja `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_CUDA_ARCHITECTURES=86 `
-            -DCUDA_TOOLKIT_ROOT_DIR="$env:CUDA_PATH" `
-            -DCMAKE_INSTALL_PREFIX="$src/install" `
-            -DCMAKE_TOOLCHAIN_FILE="$toolchain" `
-            -DVCPKG_TARGET_TRIPLET=x64-windows `
-            -DGUI_ENABLED=ON `
-            -DBUILD_TESTING=OFF
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
+            -DCUDA_ENABLED=ON \
+            -DGUI_ENABLED=OFF \
+            -DTESTS_ENABLED=OFF \
+            -DCMAKE_CUDA_ARCHITECTURES=86 \
+            -DCMAKE_CUDA_COMPILER="$CUDA_PATH/bin/nvcc.exe" \
+            2>&1 | tee configure.log
 
       - name: Build
-        shell: pwsh
+        shell: bash
+        env:
+          NVCC_APPEND_FLAGS: "-allow-unsupported-compiler -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
+          CL: "/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
         run: |
-          $ErrorActionPreference = "Stop"
-          $env:CL = "/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
-          Set-Location "$env:GITHUB_WORKSPACE/build"
-          ninja -j2 -v
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-
-      - name: Install into prefix
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          Set-Location "$env:GITHUB_WORKSPACE/build"
-          ninja install
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+          set -o pipefail
+          cmake --build build --config Release -j 2>&1 | tee build.log || {
+            echo "================ ERRORS ================"
+            grep -n -i -E "error|FAILED:" build.log | grep -v -i "warning" | head -60
+            exit 1
+          }
 
       - name: Package
-        shell: pwsh
+        shell: bash
         run: |
-          $ErrorActionPreference = "Stop"
-          $src = $env:GITHUB_WORKSPACE
-          $dist = "$src/dist"
-          New-Item -ItemType Directory -Force -Path $dist | Out-Null
-          Copy-Item -Recurse -Force "$src/install/*" $dist
-          if (-not (Test-Path "$dist/bin/colmap.exe")) {
-            throw "colmap.exe not found in dist/bin - install step produced nothing"
-          }
-          @"
-          COLMAP built with CUDA 11.8 on windows-2022 (MSVC 14.38), target GPU sm_86.
-          Target OS: Windows 10 x64.
-          Run bin/colmap.exe (or bin/colmap.exe gui). Requires an NVIDIA driver that supports CUDA 11.8.
-          "@ | Set-Content -Path "$dist/README.txt"
+          mkdir -p dist
+          cp -r build/src/colmap/exe dist/ 2>/dev/null || true
+          find build -name "colmap.exe" -exec cp {} dist/ \;
+          find build -name "*.dll" -exec cp {} dist/ \;
+          ls -la dist
 
-      - name: Upload artifact
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: colmap-cu118-win10-build
-          path: dist/
-          if-no-files-found: warn
-          retention-days: 7
+          name: colmap-cu124-win64
+          path: |
+            dist/
+            build.log
+            configure.log
