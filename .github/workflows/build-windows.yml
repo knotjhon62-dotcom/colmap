@@ -1,137 +1,114 @@
-name: COLMAP (Windows, CUDA 11.8)
+name: COLMAP (Windows 10, CUDA 11.8)
 
 on:
-  workflow_dispatch
+  workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: colmap-win-cu118-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
-    name: Build Windows CUDA 11.8
-    runs-on: windows-2022
+    # windows-2019 ships Visual Studio 2019 (MSVC 14.29), which CUDA 11.8's nvcc supports.
+    # windows-2022 ships MSVC 14.44, which CUDA 11.8 rejects (C1189).
+    runs-on: windows-2019
+    timeout-minutes: 360
+
+    env:
+      # Binary cache for vcpkg packages (uses the GitHub Actions cache backend).
+      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
 
     steps:
-      - name: Checkout
+      - name: Checkout (with submodules)
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install CUDA
+      - name: Install CUDA 11.8 toolkit
         uses: Jimver/cuda-toolkit@v0.2.19
         with:
-          cuda: '11.8.0'
+          cuda: "11.8.0"
           method: network
-          use-github-cache: false
           sub-packages: '["nvcc","cudart","thrust","visual_studio_integration","cublas_dev","cusparse_dev","cusolver_dev","curand_dev"]'
 
-      - name: Setup MSVC
+      - name: Set up MSVC 14.29 (VS 2019) environment
         uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: "14.29"
 
-      - name: Install build tools
+      - name: Install CMake and Ninja
+        shell: pwsh
+        run: choco install cmake ninja -y --no-progress
+
+      - name: Bootstrap vcpkg
         shell: pwsh
         run: |
-          choco install cmake ninja -y
+          $ErrorActionPreference = "Stop"
+          git clone --depth 1 https://github.com/Microsoft/vcpkg.git "$env:GITHUB_WORKSPACE/vcpkg"
+          & "$env:GITHUB_WORKSPACE/vcpkg/bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
-      - name: Clone and bootstrap vcpkg
+      # No separate "vcpkg install" step: with the toolchain file below, CMake
+      # runs vcpkg in manifest mode (vcpkg.json) during configure.
+      - name: Configure
         shell: pwsh
         run: |
-          git clone https://github.com/Microsoft/vcpkg.git
-          cd vcpkg
-          .\bootstrap-vcpkg.bat
-
-      - name: Install vcpkg dependencies
-        shell: pwsh
-        run: |
-          cd vcpkg
-          .\vcpkg install --triplet x64-windows
-
-      - name: Configure CMake
-        shell: bash
-        run: |
-          set -o pipefail
-          export PATH="$(cygpath -u "$VCToolsInstallDir")bin/HostX64/x64:$PATH"
-
-          mkdir -p build
-          cd build
-
-          cmake .. \
-            -G "Ninja" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CUDA_ARCHITECTURES=86 \
-            -DCUDA_TOOLKIT_ROOT_DIR="C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v11.8" \
-            -DCMAKE_TOOLCHAIN_FILE=../vcpkg/scripts/buildsystems/vcpkg.cmake \
-            -DVCPKG_TARGET_TRIPLET=x64-windows \
-            -DGUI_ENABLED=ON \
-            -DBUILD_TESTING=OFF \
-            2>&1 | tee cmake.log || {
-            echo "================ CMAKE ERRORS ================"
-            grep -n -i "error\|FAILED:" cmake.log | head -30
-            exit 1
-          }
+          $ErrorActionPreference = "Stop"
+          $src = $env:GITHUB_WORKSPACE
+          $toolchain = "$src/vcpkg/scripts/buildsystems/vcpkg.cmake"
+          New-Item -ItemType Directory -Force -Path "$src/build" | Out-Null
+          Set-Location "$src/build"
+          cmake .. -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_CUDA_ARCHITECTURES=86 `
+            -DCUDA_TOOLKIT_ROOT_DIR="$env:CUDA_PATH" `
+            -DCMAKE_INSTALL_PREFIX="$src/install" `
+            -DCMAKE_TOOLCHAIN_FILE="$toolchain" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DGUI_ENABLED=ON `
+            -DBUILD_TESTING=OFF
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Build
-        shell: bash
-        env:
-          CUDA_HOME: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v11.8"
-          DISTUTILS_USE_SDK: "1"
-          CL: "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
-          MAX_JOBS: "2"
+        shell: pwsh
         run: |
-          set -o pipefail
-          export PATH="$(cygpath -u "$VCToolsInstallDir")bin/HostX64/x64:$PATH"
+          $ErrorActionPreference = "Stop"
+          $env:CL = "/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
+          Set-Location "$env:GITHUB_WORKSPACE/build"
+          ninja -j2 -v
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
-          cd build
-          ninja -j2 -v 2>&1 | tee build.log || {
-            echo "================ BUILD ERRORS ================"
-            grep -n -i "error\|FAILED:" build.log | grep -v "warning" | head -60
-            exit 1
-          }
-
-      - name: Install
-        shell: bash
+      - name: Install into prefix
+        shell: pwsh
         run: |
-          cd build
+          $ErrorActionPreference = "Stop"
+          Set-Location "$env:GITHUB_WORKSPACE/build"
           ninja install
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
-      - name: Package artifacts
-        shell: bash
+      - name: Package
+        shell: pwsh
         run: |
-          mkdir -p dist
-          # Copy binaries, libraries, and headers
-          if [ -d "build/install" ]; then
-            cp -r build/install/* dist/ || true
-          fi
-
-          # Create README
-          cat > dist/README.txt << 'EOF'
-          COLMAP built with CUDA 11.8 support
-          - GPU architecture: RTX A2000 (compute_86)
-          - CUDA: 11.8
-          - Python: 3.11
-
-          Contents:
-          - bin/: COLMAP executables
-          - lib/: Libraries
-          - include/: Headers
-
-          To use:
-          Add the bin directory to PATH (Windows):
-          set PATH=%CD%\bin;%PATH%
-          EOF
+          $ErrorActionPreference = "Stop"
+          $src = $env:GITHUB_WORKSPACE
+          $dist = "$src/dist"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item -Recurse -Force "$src/install/*" $dist
+          if (-not (Test-Path "$dist/bin/colmap.exe")) {
+            throw "colmap.exe not found in dist/bin - install step produced nothing"
+          }
+          @"
+          COLMAP built with CUDA 11.8 on windows-2019 (MSVC 14.29), target GPU sm_86.
+          Target OS: Windows 10 x64.
+          Run bin/colmap.exe (or bin/colmap.exe gui). Requires an NVIDIA driver that supports CUDA 11.8.
+          "@ | Set-Content -Path "$dist/README.txt"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
         if: always()
+        uses: actions/upload-artifact@v4
         with:
-          name: colmap-cu118-build
-          path: |
-            dist/
-            build/cmake.log
-            build/build.log
+          name: colmap-cu118-win10-build
+          path: dist/
+          if-no-files-found: warn
+          retention-days: 7
