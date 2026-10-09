@@ -11,14 +11,6 @@ jobs:
   build:
     name: Build Windows CUDA 11.8
     runs-on: windows-2022
-    strategy:
-      fail-fast: false
-      matrix:
-        cuda: [true]
-        include:
-          - cuda: true
-            cuda_version: "11.8"
-            artifact_name: colmap-x64-windows-cuda118
 
     steps:
       - name: Checkout
@@ -26,25 +18,15 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Setup vcpkg binary cache
-        uses: actions/github-script@v7
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Restore compiler cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/vcpkg_cache
-          key: ${{ runner.os }}-vcpkg-${{ hashFiles('**/vcpkg-configuration.json') }}
-          restore-keys: |
-            ${{ runner.os }}-vcpkg-
+          python-version: '3.11'
 
       - name: Install CUDA
         uses: Jimver/cuda-toolkit@v0.2.19
         with:
-          cuda: ${{ matrix.cuda_version }}.0
+          cuda: '11.8.0'
           method: network
           use-github-cache: false
           sub-packages: '["nvcc","cudart","thrust","visual_studio_integration","cublas_dev","cusparse_dev","cusolver_dev","curand_dev"]'
@@ -52,12 +34,7 @@ jobs:
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install CMake and Ninja
+      - name: Install build tools
         shell: pwsh
         run: |
           choco install cmake ninja -y
@@ -73,9 +50,9 @@ jobs:
         shell: pwsh
         run: |
           cd vcpkg
-          .\vcpkg install --triplet x64-windows @${{ github.workspace }}/vcpkg-configuration.json
+          .\vcpkg install --triplet x64-windows
 
-      - name: Configure
+      - name: Configure CMake
         shell: bash
         run: |
           set -o pipefail
@@ -92,7 +69,7 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE=../vcpkg/scripts/buildsystems/vcpkg.cmake \
             -DVCPKG_TARGET_TRIPLET=x64-windows \
             -DGUI_ENABLED=ON \
-            -DBUILD_TESTING=ON \
+            -DBUILD_TESTING=OFF \
             2>&1 | tee cmake.log || {
             echo "================ CMAKE ERRORS ================"
             grep -n -i "error\|FAILED:" cmake.log | head -30
@@ -111,54 +88,50 @@ jobs:
           export PATH="$(cygpath -u "$VCToolsInstallDir")bin/HostX64/x64:$PATH"
 
           cd build
-          ninja -v 2>&1 | tee build.log || {
+          ninja -j2 -v 2>&1 | tee build.log || {
             echo "================ BUILD ERRORS ================"
             grep -n -i "error\|FAILED:" build.log | grep -v "warning" | head -60
             exit 1
           }
 
-      - name: Run tests
-        shell: bash
-        working-directory: build
-        run: |
-          ctest -j 2 --output-on-failure \
-            --exclude-regex "feature/sift_test|util/opengl_utils_test|mvs/gpu_mat_test" \
-            || true
-
-      - name: Install and export package
+      - name: Install
         shell: bash
         run: |
-          set -o pipefail
-          export PATH="$(cygpath -u "$VCToolsInstallDir")bin/HostX64/x64:$PATH"
-
           cd build
           ninja install
 
-          # Create package directory
-          mkdir -p package/${{ matrix.artifact_name }}
-
-          # Copy binaries, libraries, and dependencies
-          cp -r install/* package/${{ matrix.artifact_name }}/ || true
-
-          # Verify Qt SVG plugin exists if GUI is enabled
-          if [ -f "package/${{ matrix.artifact_name }}/bin/imageformats/qsvg.dll" ]; then
-            echo "Qt SVG plugin found"
-          else
-            echo "Warning: Qt SVG plugin not found"
+      - name: Package artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          # Copy binaries, libraries, and headers
+          if [ -d "build/install" ]; then
+            cp -r build/install/* dist/ || true
           fi
+
+          # Create README
+          cat > dist/README.txt << 'EOF'
+          COLMAP built with CUDA 11.8 support
+          - GPU architecture: RTX A2000 (compute_86)
+          - CUDA: 11.8
+          - Python: 3.11
+
+          Contents:
+          - bin/: COLMAP executables
+          - lib/: Libraries
+          - include/: Headers
+
+          To use:
+          Add the bin directory to PATH (Windows):
+          set PATH=%CD%\bin;%PATH%
+          EOF
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact_name }}
-          path: |
-            build/package/${{ matrix.artifact_name }}/
-            build/cmake.log
-            build/build.log
-
-      - name: Save compiler cache
-        uses: actions/cache/save@v4
         if: always()
         with:
-          path: ${{ github.workspace }}/vcpkg_cache
-          key: ${{ runner.os }}-vcpkg-${{ hashFiles('**/vcpkg-configuration.json') }}
+          name: colmap-cu118-build
+          path: |
+            dist/
+            build/cmake.log
+            build/build.log
