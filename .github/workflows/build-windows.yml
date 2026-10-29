@@ -6,7 +6,9 @@ jobs:
     runs-on: windows-2022
     env:
       VCPKG_DIR: ${{ github.workspace }}\vcpkg
-      VCPKG_DEFAULT_TRIPLET: x64-windows
+      # Release-only triplet: builds just the release dependencies (no debug DLLs,
+      # no vcruntime140d.dll requirement) and matches the official COLMAP workflow.
+      VCPKG_DEFAULT_TRIPLET: x64-windows-release
       # Persistent vcpkg binary cache, so packages are not rebuilt every run
       VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}\\vcpkg-cache,readwrite"
     steps:
@@ -55,11 +57,14 @@ jobs:
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_TOOLCHAIN_FILE="$VCPKG_DIR/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=x64-windows-release \
+            -DVCPKG_USE_LEGACY_APPLOCAL=ON \
             -DCUDA_ENABLED=ON \
-            -DGUI_ENABLED=OFF \
+            -DGUI_ENABLED=ON \
             -DTESTS_ENABLED=OFF \
             -DCMAKE_CUDA_ARCHITECTURES=86 \
             -DCMAKE_CUDA_COMPILER="$CUDA_PATH/bin/nvcc.exe" \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/install" \
             2>&1 | tee configure.log
 
       - name: Build
@@ -77,12 +82,45 @@ jobs:
           }
 
       - name: Package
-        shell: bash
+        shell: pwsh
         run: |
-          mkdir -p dist
-          find build -name "colmap.exe" -exec cp {} dist/ \;
-          find build -name "*.dll" -exec cp {} dist/ \;
-          ls -la dist
+          $ErrorActionPreference = "Stop"
+          $src = $env:GITHUB_WORKSPACE
+          $install = "$src/install"
+          $dist = "$src/dist"
+          $export = "$src/vcpkg_export"
+          $vcpkgExe = "$env:VCPKG_DIR/vcpkg.exe"
+
+          # 1. Install COLMAP itself (colmap.exe and its own DLLs) into a prefix.
+          cmake --install "$src/build" --prefix $install
+          if ($LASTEXITCODE -ne 0) { throw "cmake --install failed" }
+
+          # 2. Export the RELEASE vcpkg dependencies: Qt, Boost, CGAL, Ceres, etc.
+          #    Copying every DLL from the build tree would also pick up debug builds,
+          #    which need vcruntime140d.dll and fail to load on user machines.
+          Set-Location $src
+          & $vcpkgExe install --triplet=x64-windows-release --x-feature=gui --x-feature=cgal --x-feature=cuda
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed" }
+          & $vcpkgExe export --raw --output-dir $export --output colmap
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg export failed" }
+          $rel = "$export/colmap/installed/x64-windows-release"
+
+          # 3. Assemble dist/ with the release DLLs and Qt plugins.
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item -Recurse -Force "$install/*" $dist
+          Copy-Item "$rel/bin/*.dll" "$dist/bin"
+          Copy-Item -Recurse -Force "$rel/Qt6/plugins" $dist
+
+          # Without these the SVG toolbar/menu icons render blank, silently.
+          if (-not (Test-Path "$dist/plugins/iconengines/qsvgicon.dll")) { throw "Missing Qt SVG icon engine plugin" }
+          if (-not (Test-Path "$dist/plugins/imageformats/qsvg.dll")) { throw "Missing Qt SVG image format plugin" }
+
+          # 4. CUDA runtime DLLs the program loads at run time.
+          Copy-Item "$env:CUDA_PATH/bin/cudart64_*.dll" "$dist/bin"
+          Copy-Item "$env:CUDA_PATH/bin/curand64_*.dll" "$dist/bin"
+
+          if (-not (Test-Path "$dist/bin/colmap.exe")) { throw "colmap.exe missing from dist/bin" }
+          Get-ChildItem "$dist/bin" | Select-Object -ExpandProperty Name
 
       - uses: actions/upload-artifact@v4
         if: always()
